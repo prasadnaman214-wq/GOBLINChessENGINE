@@ -117,7 +117,7 @@ export function evaluate(chess: Chess): number {
   return matScore + pstScore;
 }
 
-function orderMoves(chess: Chess, moves: Move[]): Move[] {
+function orderMoves(moves: Move[]): Move[] {
   const scored: [number, Move][] = [];
 
   for (const m of moves) {
@@ -133,12 +133,6 @@ function orderMoves(chess: Chess, moves: Move[]): Move[] {
       priority += 900;
     }
 
-    chess.move(m);
-    if (chess.inCheck()) {
-      priority += 500;
-    }
-    chess.undo();
-
     scored.push([priority, m]);
   }
 
@@ -151,8 +145,13 @@ function minimax(
   depth: number,
   alpha: number,
   beta: number,
-  maximizing: boolean
+  maximizing: boolean,
+  deadline: number
 ): number {
+  if (Date.now() > deadline) {
+    return evaluate(chess);
+  }
+
   if (chess.isGameOver()) {
     if (chess.isCheckmate()) {
       return chess.turn() === "w" ? -20000 - depth : 20000 + depth;
@@ -172,13 +171,13 @@ function minimax(
     return 0;
   }
 
-  legalMoves = orderMoves(chess, legalMoves);
+  legalMoves = orderMoves(legalMoves);
 
   if (maximizing) {
     let maxEval = -Infinity;
     for (const move of legalMoves) {
       chess.move(move);
-      const evalVal = minimax(chess, depth - 1, alpha, beta, false);
+      const evalVal = minimax(chess, depth - 1, alpha, beta, false, deadline);
       chess.undo();
       maxEval = Math.max(maxEval, evalVal);
       alpha = Math.max(alpha, evalVal);
@@ -191,7 +190,7 @@ function minimax(
     let minEval = Infinity;
     for (const move of legalMoves) {
       chess.move(move);
-      const evalVal = minimax(chess, depth - 1, alpha, beta, true);
+      const evalVal = minimax(chess, depth - 1, alpha, beta, true, deadline);
       chess.undo();
       minEval = Math.min(minEval, evalVal);
       beta = Math.min(beta, evalVal);
@@ -214,6 +213,7 @@ export function getBestMove(chess: Chess, timeoutMs: number = 1500): Move | null
 
   const depth = legalMoves.length >= 10 ? 2 : 3;
   const startTime = Date.now();
+  const deadline = startTime + timeoutMs;
   let bestMove: Move | null = null;
 
   const turn = chess.turn();
@@ -223,15 +223,15 @@ export function getBestMove(chess: Chess, timeoutMs: number = 1500): Move | null
   let alpha = -Infinity;
   let beta = Infinity;
 
-  const orderedMoves = orderMoves(chess, legalMoves);
+  const orderedMoves = orderMoves(legalMoves);
 
   for (const move of orderedMoves) {
-    if (Date.now() - startTime > timeoutMs) {
+    if (Date.now() > deadline) {
       break;
     }
 
     chess.move(move);
-    const cleanScore = minimax(chess, depth - 1, alpha, beta, !maximizing);
+    const cleanScore = minimax(chess, depth - 1, alpha, beta, !maximizing, deadline);
     chess.undo();
 
     const noise = Math.random() * 30 - 15;
