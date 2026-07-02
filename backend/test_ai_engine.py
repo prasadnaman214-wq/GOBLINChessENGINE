@@ -59,11 +59,13 @@ class TestAIEngine(unittest.TestCase):
         fen = "2k5/2P5/2K5/8/8/8/8/8 b - - 0 1"
         board = chess.Board(fen)
         self.assertTrue(board.is_stalemate() or len(list(board.legal_moves)) == 0)
-        
-        # Test evaluate and minimax return 0 for stalemate
+
+        # FIX: evaluate() no longer handles terminal nodes — that's minimax()'s job (B-M1).
+        # Verify that minimax correctly returns 0.0 for a stalemate (draw) position.
         from ai_engine import minimax
-        self.assertEqual(evaluate(board), 0.0)
         self.assertEqual(minimax(board, 2, float("-inf"), float("inf"), False), 0.0)
+        # Also confirm board.is_game_over() so minimax hits the terminal branch before evaluate().
+        self.assertTrue(board.is_game_over())
 
     def test_minimax_checkmate_depth(self):
         # Scholar's mate position: White to move can checkmate in 1 (Qxf7#)

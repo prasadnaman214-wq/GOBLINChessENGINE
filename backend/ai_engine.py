@@ -6,7 +6,10 @@ Target strength: ~800-1200 ELO. Keep it simple and beatable.
 import chess
 import random
 import time
+import logging
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 # ─── Material values (centipawns) ────────────────────────────────────────────
 MATERIAL = {
@@ -111,21 +114,20 @@ def _pst_value(piece_type: int, color: chess.Color, square: int) -> int:
 def evaluate_detailed(board: chess.Board) -> tuple[float, float]:
     """
     Returns (material_score, positional_score) from White's perspective.
+
+    FIX B-H5: Use board.piece_map() instead of iterating all 64 squares.
+    piece_map() returns only occupied squares (~16–20 in a typical position vs 64),
+    giving a 3–4× speedup on this hotpath which is called at every leaf node.
     """
     material_score = 0.0
     positional_score = 0.0
 
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            mat = MATERIAL[piece.piece_type]
-            pst = _pst_value(piece.piece_type, piece.color, square)
-            if piece.color == chess.WHITE:
-                material_score += mat
-                positional_score += pst
-            else:
-                material_score -= mat
-                positional_score -= pst
+    for square, piece in board.piece_map().items():  # only occupied squares
+        mat = MATERIAL[piece.piece_type]
+        pst = _pst_value(piece.piece_type, piece.color, square)
+        sign = 1 if piece.color == chess.WHITE else -1
+        material_score += sign * mat
+        positional_score += sign * pst
 
     return material_score, positional_score
 
@@ -134,12 +136,10 @@ def evaluate(board: chess.Board) -> float:
     """
     Simple evaluation: material + piece-square tables.
     Small random noise is added by the caller to simulate human inconsistency.
-    """
-    if board.is_game_over():
-        if board.is_checkmate():
-            return -20000.0 if board.turn == chess.WHITE else 20000.0
-        return 0.0
 
+    FIX B-M1: Removed redundant board.is_game_over() check — minimax already
+    handles terminal nodes before calling evaluate(), so this guard was unreachable.
+    """
     mat_score, pst_score = evaluate_detailed(board)
     return mat_score + pst_score
 
@@ -148,27 +148,32 @@ def _order_moves(board: chess.Board, moves: list[chess.Move]) -> list[chess.Move
     """
     Move ordering: captures and checks first for better alpha-beta pruning.
     This is a performance optimization, not a strength increase.
+
+    FIX B-C2: Previously used board.push(m)/board.pop() inside the sort key to detect
+    checks, causing O(N²) board mutations per node. Replaced with board.gives_check(m)
+    which checks for check without mutating the board at all.
+    Also pre-computes piece lookups in a linear pass before sorting (O(N)) instead of
+    re-calling piece_at() O(N log N) times inside the sort comparator.
     """
-    def move_priority(m: chess.Move) -> int:
+    piece_at = board.piece_at  # local reference avoids repeated attribute lookup
+    scored: list[tuple[int, chess.Move]] = []
+    for m in moves:
         priority = 0
         if board.is_capture(m):
-            captured = board.piece_at(m.to_square)
-            if captured:
-                priority += 1000 + MATERIAL.get(captured.piece_type, 0) - MATERIAL.get(
-                    board.piece_at(m.from_square).piece_type, 0
-                )
-        # Promotions are good
+            captured = piece_at(m.to_square)
+            attacker = piece_at(m.from_square)
+            if captured and attacker:
+                # MVV-LVA: Most Valuable Victim - Least Valuable Attacker
+                priority += 1000 + MATERIAL.get(captured.piece_type, 0) - MATERIAL.get(attacker.piece_type, 0)
+            else:
+                priority += 500
         if m.promotion:
             priority += 900
-        # Checks put pressure
-        board.push(m)
-        if board.is_check():
+        if board.gives_check(m):  # FIX B-C2: no board.push/pop — zero board mutations
             priority += 500
-        board.pop()
-        return priority
-
-    moves.sort(key=move_priority, reverse=True)
-    return moves
+        scored.append((priority, m))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [m for _, m in scored]
 
 
 def minimax(
@@ -280,27 +285,20 @@ def get_best_move(board: chess.Board, timeout_seconds: float = 1.5) -> Optional[
                 best_move = move
             beta = min(beta, clean_score)
 
-    # Ensure we return something legal even if we timed out
+    # Ensure we return something legal even if we timed out before any move was evaluated
     if best_move is None:
+        # FIX B-C3: Previously called minimax() again here, completely defeating the
+        # timeout. Now just return a random legal move — fast and safe.
         best_move = random.choice(legal_moves)
-        board.push(best_move)
-        best_clean_score = minimax(board, depth - 1, alpha, beta, not maximizing)
-        board.pop()
-        best_noise = 0.0
-        best_score = best_clean_score
 
     elapsed = time.time() - start_time
-    
-    # Get static evaluation of the final position chosen
-    board.push(best_move)
-    mat_score, pst_score = evaluate_detailed(board)
-    board.pop()
-    
-    print(
-        f"[AI] Depth={depth} | Move={best_move.uci()} | "
-        f"Material={mat_score:.1f} | Positional={pst_score:.1f} | "
-        f"Noise={best_noise:.1f} | Total Score={best_score:.1f} | "
-        f"Time={elapsed:.3f}s"
+
+    # FIX B-M2 + B-M3: Removed extra board.push/evaluate_detailed/board.pop purely for
+    # debug logging (redundant evaluation). Use scores already tracked during the search.
+    # Replaced print() with structured logger.debug() — filterable, non-blocking, no GIL stdout lock.
+    logger.debug(
+        "[AI] depth=%d move=%s clean_score=%.1f noise=%.1f total=%.1f time=%.3fs",
+        depth, best_move.uci(), best_clean_score, best_noise, best_score, elapsed,
     )
 
     return best_move

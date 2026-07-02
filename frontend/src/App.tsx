@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import { Chessboard } from "react-chessboard";
 import { Chess } from "chess.js";
+import type { Move } from "chess.js";
 import {
   newGame,
   makeMove,
@@ -12,6 +13,31 @@ import "./App.css";
 
 const STARTING_FEN =
   "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+// ─── Module-level constants (created once, never re-allocated on render) ───────
+
+/** Static board style — hoisted so React.memo can get stable object references. */
+const BOARD_STYLE: React.CSSProperties = {
+  borderRadius: "4px",
+  boxShadow: "0 8px 32px rgba(0,0,0,0.35)",
+};
+const DARK_SQ_STYLE: React.CSSProperties = { backgroundColor: "#769656" };
+const LIGHT_SQ_STYLE: React.CSSProperties = { backgroundColor: "#eeeed2" };
+
+/** Stable empty array — avoids new [] allocation when no square is selected. */
+const EMPTY_MOVES: Move[] = [];
+
+/** Set lookup is O(1) and avoids a new array literal on every render. */
+const GAME_OVER_STATUSES = new Set(["checkmate", "stalemate", "draw", "resign"]);
+
+// ─── Pure utility functions (outside component — created once) ─────────────────
+
+/** Format seconds as M:SS. Pure function — lives at module scope. */
+function formatTime(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
 
 interface MoveHistoryItem {
   san: string;
@@ -79,34 +105,34 @@ const ChessboardComponent = React.memo(({
   canDragPiece,
   onPieceDrag
 }: MemoizedBoardProps) => {
-  return (
-    <Chessboard
-      options={{
-        position: fen,
-        boardOrientation: playerColor,
-        boardStyle: {
-          borderRadius: "4px",
-          boxShadow: "0 8px 32px rgba(0,0,0,0.35)",
-        },
-        darkSquareStyle: { backgroundColor: "#769656" },
-        lightSquareStyle: { backgroundColor: "#eeeed2" },
-        animationDurationInMs: 200,
-        allowDragging: !isGameOver && !isAiThinking && turn === playerColor,
-        onPieceDrop,
-        squareStyles: customSquareStyles,
-        showNotation: true,
-        onSquareClick: ({ square }) => onSquareClick(square),
-        canDragPiece: ({ piece, square }) => {
-          if (!square) return false;
-          return canDragPiece({ piece, square });
-        },
-        onPieceDrag: ({ square }) => {
-          if (square) onPieceDrag(square);
-        }
-      }}
-    />
-  );
+  // FIX F-C1 + F-C2: memoize the options object so React.memo's shallow comparison
+  // actually works. Previously a new options object (with inline arrow fns) was
+  // created on every parent render, defeating the memo entirely.
+  const options = useMemo(() => ({
+    position: fen,
+    boardOrientation: playerColor,
+    boardStyle: BOARD_STYLE,        // stable module-level constant
+    darkSquareStyle: DARK_SQ_STYLE, // stable module-level constant
+    lightSquareStyle: LIGHT_SQ_STYLE,
+    animationDurationInMs: 200,
+    allowDragging: !isGameOver && !isAiThinking && turn === playerColor,
+    onPieceDrop,
+    squareStyles: customSquareStyles,
+    showNotation: true,
+    onSquareClick: ({ square }: { square: string | null }) => { if (square) onSquareClick(square); },
+    canDragPiece: ({ piece, square }: { piece: any; square: string | null; isSparePiece?: boolean }) => {
+      if (!square) return false;
+      return canDragPiece({ piece, square });
+    },
+    onPieceDrag: ({ square }: { square: string | null }) => {
+      if (square) onPieceDrag(square);
+    },
+  }), [fen, playerColor, isGameOver, isAiThinking, turn, onPieceDrop,
+       customSquareStyles, onSquareClick, canDragPiece, onPieceDrag]);
+
+  return <Chessboard options={options} />;
 });
+ChessboardComponent.displayName = "ChessboardComponent";
 
 export default function App() {
   const [gameId, setGameId] = useState<string | null>(null);
@@ -124,7 +150,8 @@ export default function App() {
   const [blackTime, setBlackTime] = useState<number>(0);
   const [playerColor, setPlayerColor] = useState<"white" | "black">("white");
   const [selectedSquare, setSelectedSquare] = useState<string | null>(null);
-  const isGameOver = ["checkmate", "stalemate", "draw", "resign"].includes(status);
+  // FIX F-H1: useMemo + module-level Set avoids allocating a new array on every render.
+  const isGameOver = useMemo(() => GAME_OVER_STATUSES.has(status), [status]);
 
   // Local chess.js instance for client-side move validation
   const chessRef = useRef<Chess>(new Chess());
@@ -254,20 +281,27 @@ export default function App() {
 
 
 
-  // Timer
+  // FIX F-C3: Keep current turn in a ref so the interval callback always reads the
+  // latest value without restarting the interval on every move. Previously 'turn' in
+  // the dep array caused clearInterval+setInterval on each move, potentially skipping
+  // ~1 second of clock time after every move.
+  const turnRef = useRef(turn);
+  useEffect(() => { turnRef.current = turn; }, [turn]);
+
+  // Timer — stable interval; only restarts when game-over state or AI state changes.
   useEffect(() => {
     if (showGameOver || isAiThinking) {
       if (timerRef.current) clearInterval(timerRef.current);
       return;
     }
     timerRef.current = setInterval(() => {
-      setWhiteTime((t) => (turn === "white" ? t + 1 : t));
-      setBlackTime((t) => (turn === "black" ? t + 1 : t));
+      if (turnRef.current === "white") setWhiteTime((t) => t + 1);
+      else setBlackTime((t) => t + 1);
     }, 1000);
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [turn, showGameOver, isAiThinking]);
+  }, [showGameOver, isAiThinking]); // 'turn' intentionally removed — handled via ref
 
   // Clean up timeouts
   useEffect(() => {
@@ -476,12 +510,9 @@ export default function App() {
       setSelectedSquare(null); // Clear selectedSquare immediately on drop
       if (!targetSquare) return false;
 
-      // Client-side validation: is this move legal?
-      const moves = chessRef.current.moves({ square: sourceSquare as any, verbose: true });
-      const isValid = moves.some((m) => m.to === targetSquare);
-      if (!isValid) return false;
-
-      // Execute the move
+      // FIX F-H5: Removed redundant pre-validation via chessRef.current.moves().
+      // executeMove already calls chessRef.current.move() which validates internally
+      // and returns null for illegal moves — no need to validate twice.
       executeMove(sourceSquare, targetSquare);
       return true;
     },
@@ -503,35 +534,48 @@ export default function App() {
     }
   }, [gameId, isGameOver]);
 
-  const formatTime = (seconds: number): string => {
-    const m = Math.floor(seconds / 60);
-    const s = seconds % 60;
-    return `${m}:${s.toString().padStart(2, "0")}`;
-  };
+  // FIX F-H7/H8/H9: Stable onClick handlers — previously inline arrow fns recreated every render.
+  // handleNewGameSameColor renders every timer tick (every second), so this is especially important.
+  const handlePlayAgain = useCallback(() => {
+    setShowGameOver(false);
+    handleNewGame(playerColor);
+  }, [handleNewGame, playerColor]);
 
-  const gameOverReason = getGameOverReason(status, drawReason);
+  const handlePlayAsWhite = useCallback(() => handleNewGame("white"), [handleNewGame]);
+  const handlePlayAsBlack = useCallback(() => handleNewGame("black"), [handleNewGame]);
+  const handleNewGameSameColor = useCallback(() => handleNewGame(playerColor), [handleNewGame, playerColor]);
 
-  // Helper to find the checkmated/losing king square
-  const getLosingKingSquare = useCallback((): string | null => {
+  // FIX F-H2: formatTime moved to module scope (see top of file) — no longer recreated on every render.
+
+  // FIX F-H3: memoize derived game-over values so they don't recompute on every timer tick.
+  const gameOverReason = useMemo(() => getGameOverReason(status, drawReason), [status, drawReason]);
+  const gameOverResultText = useMemo(() => formatResult(status, turn, drawReason), [status, turn, drawReason]);
+
+  // FIX F-H4: Replace useCallback with useMemo so the 8×8 board scan only runs
+  // when `status` changes (i.e., once at checkmate), not on every customSquareStyles
+  // recomputation (which happened on every lastMove/highlight change).
+  const losingKingSquare = useMemo((): string | null => {
     if (status !== "checkmate") return null;
     const losingColor = chessRef.current.turn();
     const board = chessRef.current.board();
+    const files = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    const ranks = ["8", "7", "6", "5", "4", "3", "2", "1"];
     for (let r = 0; r < 8; r++) {
-      const row = board[r];
       for (let c = 0; c < 8; c++) {
-        const piece = row[c];
+        const piece = board[r][c];
         if (piece && piece.type === "k" && piece.color === losingColor) {
-          const files = ["a", "b", "c", "d", "e", "f", "g", "h"];
-          const ranks = ["8", "7", "6", "5", "4", "3", "2", "1"];
           return files[c] + ranks[r];
         }
       }
     }
     return null;
-  }, [status]);
+  }, [status]); // only re-runs when game status changes
 
   const highlightedMoves = useMemo(() => {
-    return selectedSquare ? getLegalMovesForSquare(selectedSquare) : [];
+    // Short-circuit when no square selected — returns stable EMPTY_MOVES constant
+    // instead of allocating a new [] on every render.
+    if (!selectedSquare) return EMPTY_MOVES;
+    return getLegalMovesForSquare(selectedSquare);
   }, [selectedSquare, getLegalMovesForSquare, fen]); // re-evaluate when board state changes
 
   const handleSquareClick = useCallback(
@@ -589,7 +633,8 @@ export default function App() {
     }
 
     // 2. Highlight losing king's square with red-flash animation
-    const losingKingSquare = getLosingKingSquare();
+    // FIX F-H4: losingKingSquare is now a useMemo (not a useCallback call),
+    // so it doesn't trigger an extra 8×8 scan here.
     if (losingKingSquare) {
       styles[losingKingSquare] = {
         animation: "red-flash 1.5s ease-in-out infinite",
@@ -613,7 +658,7 @@ export default function App() {
     });
 
     return styles;
-  }, [lastMove, highlightedMoves, getLosingKingSquare]);
+  }, [lastMove, highlightedMoves, losingKingSquare]);
 
   return (
     <div className="app">
@@ -644,15 +689,16 @@ export default function App() {
               <h2>Welcome to Chess AI</h2>
               <p>Choose your color to start a new game</p>
               <div className="start-buttons">
+                {/* FIX F-H8: useCallback-wrapped handlers avoid new fn refs on every render */}
                 <button
                   className="btn btn-primary btn-large"
-                  onClick={() => handleNewGame("white")}
+                  onClick={handlePlayAsWhite}
                 >
                   ♔ Play as White
                 </button>
                 <button
                   className="btn btn-secondary btn-large"
-                  onClick={() => handleNewGame("black")}
+                  onClick={handlePlayAsBlack}
                 >
                   ♚ Play as Black
                 </button>
@@ -667,8 +713,9 @@ export default function App() {
                 }`}
               >
                 <div className="chessboard-container">
+                  {/* FIX F-M1: Removed key prop — it was causing full unmount/remount of
+                      the board on every fullscreen toggle. CSS :fullscreen handles layout. */}
                   <ChessboardComponent
-                    key={isFullscreen ? "fullscreen" : "normal"}
                     fen={fen}
                     playerColor={playerColor}
                     isGameOver={isGameOver}
@@ -731,9 +778,10 @@ export default function App() {
                   ) : (
                     moveHistory.map((m, i) => (
                       <div
-                        key={i}
+                        key={`move-${i}-${m.uci}`}
                         className={`move-row ${i % 2 === 0 ? "white-move" : "black-move"}`}
                       >
+                        {/* FIX F-H6: Composite key instead of array index — stable on reorder/reset */}
                         {i % 2 === 0 && (
                           <span className="move-number">
                             {Math.floor(i / 2) + 1}.
@@ -749,9 +797,10 @@ export default function App() {
               <div className="panel-section">
                 <div className="section-title">Controls</div>
                 <div className="control-buttons">
+                  {/* FIX F-H9: useCallback-wrapped — this renders every timer tick */}
                   <button
                     className="btn btn-primary"
-                    onClick={() => handleNewGame(playerColor)}
+                    onClick={handleNewGameSameColor}
                   >
                     New Game
                   </button>
@@ -796,12 +845,14 @@ export default function App() {
             </div>
             <h2>Game Over</h2>
             <p className="result-text">
-              {formatResult(status, turn, drawReason)}
+              {/* FIX F-H3: use memoized value instead of calling formatResult inline */}
+              {gameOverResultText}
             </p>
             <div className="modal-buttons">
+              {/* FIX F-H7: useCallback-wrapped — avoids new fn ref on every render */}
               <button
                 className="btn btn-primary btn-large"
-                onClick={() => { setShowGameOver(false); handleNewGame(playerColor); }}
+                onClick={handlePlayAgain}
               >
                 Play Again
               </button>
