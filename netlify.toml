@@ -13,12 +13,3 @@
   from = "/*"
   to = "/index.html"
   status = 200
-
-# Proxy /api/* requests to your FastAPI backend. 
-# Once you deploy your backend (e.g. to Render, Railway, or Fly.io),
-# replace the URL below with your live backend API URL.
-[[redirects]]
-  from = "/api/*"
-  to = "http://localhost:8000/api/:splat" # <-- Replace with your live backend URL
-  status = 200
-  force = true
