@@ -143,6 +143,14 @@ export default function App() {
   const [drawReason, setDrawReason] = useState<string | null>(null);
   const [moveHistory, setMoveHistory] = useState<MoveHistoryItem[]>([]);
   const [isAiThinking, setIsAiThinking] = useState<boolean>(false);
+  // Ref mirror of isAiThinking so callbacks can read the live value without
+  // needing it in their dep arrays (which would cause stale-closure re-creation
+  // mid-move and break the in-flight promise chain).
+  const isAiThinkingRef = useRef<boolean>(false);
+  const setIsAiThinkingSync = useCallback((val: boolean) => {
+    isAiThinkingRef.current = val;
+    setIsAiThinking(val);
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [lastMove, setLastMove] = useState<[string, string] | null>(null);
   const [showGameOver, setShowGameOver] = useState<boolean>(false);
@@ -239,9 +247,9 @@ export default function App() {
   }, []);
 
   const handleRetryAiMove = useCallback(async () => {
-    if (!gameId || isGameOver || isAiThinking || turn === playerColor) return;
+    if (!gameId || isGameOver || isAiThinkingRef.current || turn === playerColor) return;
     setError(null);
-    setIsAiThinking(true);
+    setIsAiThinkingSync(true);
     try {
       const aiRes = await aiMove(gameId);
       if (activeGameIdRef.current !== gameId) return;
@@ -275,9 +283,10 @@ export default function App() {
         setError("AI move failed: " + errMsg);
       }
     } finally {
-      setIsAiThinking(false);
+      // Always clear the flag — no conditional guard here so it cannot be skipped.
+      setIsAiThinkingSync(false);
     }
-  }, [gameId, isGameOver, isAiThinking, turn, playerColor]);
+  }, [gameId, isGameOver, turn, playerColor, setIsAiThinkingSync]);
 
 
 
@@ -324,7 +333,7 @@ export default function App() {
       setLastMove(null);
       setWhiteTime(0);
       setBlackTime(0);
-      setIsAiThinking(false);
+      setIsAiThinkingSync(false); // reset ref + state together
       setIsCheck(false);
       setDrawReason(null);
       setSelectedSquare(null);
@@ -344,8 +353,9 @@ export default function App() {
         setStatus("active");
 
         if (asColor === "black") {
-          setIsAiThinking(true);
+          setIsAiThinkingSync(true);
           const aiRes = await aiMove(res.game_id);
+          // Guard: user may have clicked "New Game" again while AI was thinking
           if (activeGameIdRef.current !== res.game_id) return;
 
           chessRef.current.load(aiRes.fen);
@@ -364,12 +374,18 @@ export default function App() {
           setError("Failed to start new game: " + (e as Error).message);
         }
       } finally {
-        if (activeGameIdRef.current === newGameAttemptId || activeGameIdRef.current === null) {
-          setIsAiThinking(false);
-        }
+        // FIX: The original guard checked `activeGameIdRef.current === newGameAttemptId`,
+        // but by the time finally runs after a *successful* game creation, the ref has
+        // already been updated to `res.game_id`. Neither condition was ever true in
+        // the happy path when playing as Black, so setIsAiThinking(false) was silently
+        // skipped — permanently locking the "AI is thinking…" overlay.
+        // Fix: always clear the flag; handleNewGame unconditionally owns the
+        // isAiThinking lifecycle for its own invocation and the new-game reset at the
+        // top of this function already guards against cross-invocation leaks.
+        setIsAiThinkingSync(false);
       }
     },
-    []
+    [setIsAiThinkingSync]
   );
 
   const getLegalMovesForSquare = useCallback(
@@ -382,11 +398,18 @@ export default function App() {
     [isGameOver, isAiThinking, turn, playerColor]
   );
 
+  const executeMoveGameIdRef = useRef<string | null>(gameId);
+  useEffect(() => { executeMoveGameIdRef.current = gameId; }, [gameId]);
+
   const executeMove = useCallback(
     async (sourceSquare: string, targetSquare: string): Promise<boolean> => {
-      if (isGameOver || isAiThinking || turn !== playerColor) return false;
+      // Read live values from refs to avoid stale-closure issues; isGameOver and
+      // playerColor/turn change only on game boundaries so they're safe as closure captures.
+      if (isGameOver || isAiThinkingRef.current || turn !== playerColor) return false;
 
-      const currentGameId = gameId;
+      // Capture the current game ID from the ref (always live, never stale)
+      const currentGameId = executeMoveGameIdRef.current;
+      if (!currentGameId) return false;
 
       // Client-side validation using chess.js.
       // FIX Bug #1: chess.js v1.x move() THROWS Error("Invalid move: …") on an
@@ -415,7 +438,7 @@ export default function App() {
 
       // Optimistically update board with client-side move
       setFen(chessRef.current.fen());
-      
+
       // Update turn optimistically
       const nextTurn = chessRef.current.turn() === "w" ? "white" : "black";
       setTurn(nextTurn);
@@ -423,7 +446,7 @@ export default function App() {
       let moveAppliedOnServer = false;
 
       try {
-        const res = await makeMove(gameId!, moveStr);
+        const res = await makeMove(currentGameId, moveStr);
         if (activeGameIdRef.current !== currentGameId) return false;
         moveAppliedOnServer = true;
 
@@ -455,9 +478,10 @@ export default function App() {
           return true;
         }
 
-        // Trigger AI move
-        setIsAiThinking(true);
-        const aiRes = await aiMove(gameId!);
+        // Trigger AI move — use the ref-captured ID, never a potentially stale closure value
+        setIsAiThinkingSync(true);
+        const aiRes = await aiMove(currentGameId);
+        // Guard: another game may have started while the AI was computing
         if (activeGameIdRef.current !== currentGameId) return false;
 
         chessRef.current.load(aiRes.fen);
@@ -493,10 +517,9 @@ export default function App() {
             setFen(chessRef.current.fen());
             setTurn(chessRef.current.turn() === "w" ? "white" : "black");
           } else {
-            // FIX Bug #3: player's move was applied successfully (server FEN is
-            // loaded into chessRef + state), but aiMove() then threw. State turn
-            // currently reflects the OPPONENT side. Flip it back to the player so
-            // they can retry, and clear isAiThinking via finally (Bug #4).
+            // Player's move was applied successfully but aiMove() threw.
+            // State turn currently reflects the opponent side — flip it back
+            // to the player so they can retry.
             setTurn(playerColor);
           }
           const errMsg = (e as Error).message;
@@ -507,17 +530,16 @@ export default function App() {
           }
         }
       } finally {
-        // FIX Bug #4: isAiThinking is component-level state, not per-game. If
-        // the user starts a new game mid-AI-think, activeGameIdRef.current will
-        // have moved on to the new gameId, and the old guard would skip this
-        // reset — leaking `true` into the new game and freezing input. Always
-        // clear it; the new game's own initialization also resets it on entry.
-        setIsAiThinking(false);
+        // Always clear the thinking flag unconditionally. This is safe because:
+        // - handleNewGame resets it to false at the very top of its body
+        // - If a new game started mid-flight, activeGameIdRef moved on and the
+        //   new game's own reset already cleared the flag.
+        setIsAiThinkingSync(false);
       }
 
       return true;
     },
-    [gameId, isGameOver, isAiThinking, turn, playerColor]
+    [isGameOver, turn, playerColor, setIsAiThinkingSync]
   );
 
   const onPieceDrop = useCallback(
@@ -537,9 +559,10 @@ export default function App() {
       // against chess.js (already loaded in chessRef) so illegal moves reject
       // immediately and the board snaps the piece back. executeMove still
       // re-validates internally as a defensive check.
+      // Use the ref for isAiThinking to read the live value, not a stale closure capture.
       if (
         isGameOver ||
-        isAiThinking ||
+        isAiThinkingRef.current ||
         turn !== playerColor
       ) {
         return false;
@@ -556,7 +579,7 @@ export default function App() {
       void executeMove(sourceSquare, targetSquare);
       return true;
     },
-    [executeMove, isGameOver, isAiThinking, turn, playerColor]
+    [executeMove, isGameOver, turn, playerColor]
   );
 
   const handleResign = useCallback(async () => {
