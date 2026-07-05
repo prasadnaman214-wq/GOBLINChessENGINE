@@ -388,15 +388,26 @@ export default function App() {
 
       const currentGameId = gameId;
 
-      // Client-side validation using chess.js
-      const moveResult = chessRef.current.move({
-        from: sourceSquare,
-        to: targetSquare,
-        promotion: "q", // Auto-promote to queen for simplicity
-      });
+      // Client-side validation using chess.js.
+      // FIX Bug #1: chess.js v1.x move() THROWS Error("Invalid move: …") on an
+      // illegal move instead of returning null. The old `if (!moveResult)` guard
+      // was dead code and the throw escaped into the surrounding catch block
+      // AFTER mutating chessRef.current — leaving state half-applied and the
+      // outer catch logic running with stale assumptions. Catch here, before
+      // any state mutation, and reject cleanly.
+      let moveResult;
+      try {
+        moveResult = chessRef.current.move({
+          from: sourceSquare,
+          to: targetSquare,
+          promotion: "q", // Auto-promote to queen for simplicity
+        });
+      } catch {
+        return false; // Illegal move — reject
+      }
 
       if (!moveResult) {
-        return false; // Illegal move — reject
+        return false; // Illegal move — reject (defensive: some v1.x paths can return null)
       }
 
       const moveStr = sourceSquare + targetSquare + (moveResult.promotion ? moveResult.promotion : "");
@@ -481,6 +492,12 @@ export default function App() {
             chessRef.current.undo();
             setFen(chessRef.current.fen());
             setTurn(chessRef.current.turn() === "w" ? "white" : "black");
+          } else {
+            // FIX Bug #3: player's move was applied successfully (server FEN is
+            // loaded into chessRef + state), but aiMove() then threw. State turn
+            // currently reflects the OPPONENT side. Flip it back to the player so
+            // they can retry, and clear isAiThinking via finally (Bug #4).
+            setTurn(playerColor);
           }
           const errMsg = (e as Error).message;
           if (errMsg.includes("Game not found") || errMsg.includes("404")) {
@@ -490,9 +507,12 @@ export default function App() {
           }
         }
       } finally {
-        if (activeGameIdRef.current === currentGameId) {
-          setIsAiThinking(false);
-        }
+        // FIX Bug #4: isAiThinking is component-level state, not per-game. If
+        // the user starts a new game mid-AI-think, activeGameIdRef.current will
+        // have moved on to the new gameId, and the old guard would skip this
+        // reset — leaking `true` into the new game and freezing input. Always
+        // clear it; the new game's own initialization also resets it on entry.
+        setIsAiThinking(false);
       }
 
       return true;
@@ -510,13 +530,33 @@ export default function App() {
       setSelectedSquare(null); // Clear selectedSquare immediately on drop
       if (!targetSquare) return false;
 
-      // FIX F-H5: Removed redundant pre-validation via chessRef.current.moves().
-      // executeMove already calls chessRef.current.move() which validates internally
-      // and returns null for illegal moves — no need to validate twice.
-      executeMove(sourceSquare, targetSquare);
+      // FIX Bug #2: react-chessboard reads onPieceDrop's return value SYNCHRONOUSLY
+      // (no `await`) to decide whether to keep the piece in the drop target or
+      // snap it back. executeMove returns Promise<boolean>, so we cannot forward
+      // its resolved value through this return slot. Pre-validate synchronously
+      // against chess.js (already loaded in chessRef) so illegal moves reject
+      // immediately and the board snaps the piece back. executeMove still
+      // re-validates internally as a defensive check.
+      if (
+        isGameOver ||
+        isAiThinking ||
+        turn !== playerColor
+      ) {
+        return false;
+      }
+      const legalMoves = chessRef.current.moves({
+        square: sourceSquare as any,
+        verbose: true,
+      });
+      const isLegal = legalMoves.some((m) => m.to === targetSquare);
+      if (!isLegal) return false;
+
+      // Kick off the async pipeline; the sync check above is the authoritative
+      // signal for snap-back.
+      void executeMove(sourceSquare, targetSquare);
       return true;
     },
-    [executeMove]
+    [executeMove, isGameOver, isAiThinking, turn, playerColor]
   );
 
   const handleResign = useCallback(async () => {

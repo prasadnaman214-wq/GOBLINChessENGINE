@@ -165,7 +165,9 @@ function minimax(
 
   let legalMoves = chess.moves({ verbose: true });
   if (legalMoves.length === 0) {
-    if (chess.isCheck() || chess.inCheck()) {
+    // FIX Incidental: chess.inCheck() is a deprecated alias that resolves to
+    // chess.isCheck() in chess.js v1.x (same backing field). Drop the OR branch.
+    if (chess.isCheck()) {
       return chess.turn() === "w" ? -20000 - depth : 20000 + depth;
     }
     return 0;
